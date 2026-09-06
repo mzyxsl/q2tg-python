@@ -194,6 +194,21 @@ def telegram_media_kind(msg: Message) -> str:
     return "file"
 
 
+def telegram_message_has_spoiler(msg: Message) -> bool:
+    """判断消息或媒体是否带 Telegram 遮罩（spoiler）。"""
+    if getattr(msg, "has_media_spoiler", False):
+        return True
+    spoiler_type = getattr(MessageEntity, "SPOILER", "spoiler")
+    return any(
+        getattr(entity, "type", None) == spoiler_type
+        for entities in (
+            getattr(msg, "entities", None),
+            getattr(msg, "caption_entities", None),
+        )
+        for entity in (entities or ())
+    )
+
+
 class TGhandlers:
     """Telegram 命令、文本和媒体入口集合。
 
@@ -1033,6 +1048,8 @@ class TGhandlers:
             return
         if not await self._can_forward_sender(msg, context.bot.id):
             return
+        if telegram_message_has_spoiler(msg):
+            return
         user_id = msg.from_user.id if msg.from_user is not None else 0
         sender_name = msg.from_user.full_name if msg.from_user is not None else f"Telegram用户 {user_id}"
         at_user_id = await self._inline_at_user_id(msg, context.bot.id)
@@ -1220,6 +1237,8 @@ class TGhandlers:
         if not await sql.get_tg_forward_enabled(first.chat_id):
             return
         if not await self._can_forward_sender(first, bot_id):
+            return
+        if any(telegram_message_has_spoiler(message) for message in messages):
             return
         user_id = first.from_user.id if first.from_user is not None else 0
         sender_name = first.from_user.full_name if first.from_user is not None else f"Telegram用户 {user_id}"
