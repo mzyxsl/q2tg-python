@@ -18,6 +18,7 @@ from src.media import (
     communicate_media_process,
     decode_process_error,
     finalize_media,
+    media_input_path,
     run_media_thread,
     start_media_process,
     transcode_target,
@@ -62,34 +63,36 @@ async def video_sticker_to_gif(media: MediaFile, *, size_limit: int) -> None:
     """使用 ffmpeg 将 WebM/VP9 视频贴纸转换为循环透明 GIF。"""
     started_at = time.monotonic()
     async with transcode_target(".gif") as output_path:
-        input_fd = media.fileno()
-        media.rewind()
-        process = await start_media_process(
-            *FFMPEG_BASE_ARGS,
-            "-c:v",
-            "libvpx-vp9",
-            "-i",
-            f"/proc/self/fd/{input_fd}",
-            "-filter_complex",
-            (
-                "[0:v]fps=15,scale=512:512:force_original_aspect_ratio=decrease:"
-                "flags=lanczos,split[s0][s1];"
-                "[s0]palettegen=reserve_transparent=1:stats_mode=diff[p];"
-                "[s1][p]paletteuse=dither=sierra2_4a:alpha_threshold=128"
-            ),
-            "-loop",
-            "0",
-            "-fs",
-            str(size_limit + 1),
-            str(output_path),
-            pass_fds=(input_fd,),
-            missing_error="视频贴纸转发需要安装 ffmpeg",
-        )
-        _, stderr = await communicate_media_process(
-            process,
-            timeout=STICKER_TRANSCODE_TIMEOUT,
-            timeout_error="Telegram 视频贴纸转换超时",
-        )
+        async with media_input_path(media, suffix=".webm") as (
+            input_path,
+            process_kwargs,
+        ):
+            process = await start_media_process(
+                *FFMPEG_BASE_ARGS,
+                "-c:v",
+                "libvpx-vp9",
+                "-i",
+                input_path,
+                "-filter_complex",
+                (
+                    "[0:v]fps=15,scale=512:512:force_original_aspect_ratio=decrease:"
+                    "flags=lanczos,split[s0][s1];"
+                    "[s0]palettegen=reserve_transparent=1:stats_mode=diff[p];"
+                    "[s1][p]paletteuse=dither=sierra2_4a:alpha_threshold=128"
+                ),
+                "-loop",
+                "0",
+                "-fs",
+                str(size_limit + 1),
+                str(output_path),
+                **process_kwargs,
+                missing_error="视频贴纸转发需要安装 ffmpeg",
+            )
+            _, stderr = await communicate_media_process(
+                process,
+                timeout=STICKER_TRANSCODE_TIMEOUT,
+                timeout_error="Telegram 视频贴纸转换超时",
+            )
         if process.returncode != 0:
             raise ValueError(f"Telegram 视频贴纸转换失败: {decode_process_error(stderr)}")
         if output_path.stat().st_size > size_limit:
@@ -146,16 +149,15 @@ async def tgs_sticker_to_gif(media: MediaFile) -> None:
                 "docker",
                 "run",
                 "--rm",
-                "--user",
-                f"{os.getuid()}:{os.getgid()}",
+                *_docker_user_arguments(),
                 "--volume",
                 f"{mount}:/source",
                 LOTTIE_CONVERTER_IMAGE,
                 "bash",
                 "/usr/bin/lottie_to_gif.sh",
                 *_lottie_arguments(
-                    Path("/source") / source_path.name,
-                    Path("/source") / output_path.name,
+                    f"/source/{source_path.name}",
+                    f"/source/{output_path.name}",
                 ),
                 missing_error="本地 TGS 贴纸转发需要安装 Docker",
                 failure_prefix="Docker TGS 贴纸转换失败",
@@ -172,7 +174,7 @@ async def tgs_sticker_to_gif(media: MediaFile) -> None:
         baselog.info("TGS 贴纸转码完成，耗时 %.2f 秒", time.monotonic() - started_at)
 
 
-def _lottie_arguments(source_path: Path, output_path: Path) -> tuple[str, ...]:
+def _lottie_arguments(source_path: str | Path, output_path: str | Path) -> tuple[str, ...]:
     return (
         "--width",
         "512",
@@ -188,6 +190,13 @@ def _lottie_arguments(source_path: Path, output_path: Path) -> tuple[str, ...]:
         str(output_path),
         str(source_path),
     )
+
+
+def _docker_user_arguments() -> tuple[str, ...]:
+    """在 Unix 上保留宿主用户映射；Windows 没有 getuid/getgid。"""
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        return ("--user", f"{os.getuid()}:{os.getgid()}")
+    return ()
 
 
 def _copy_tgs_json(compressed: gzip.GzipFile, output_path: Path) -> None:

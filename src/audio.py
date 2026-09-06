@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from src.log import baselog
 from src.media import (
@@ -16,6 +17,7 @@ from src.media import (
     communicate_media_process,
     decode_process_error,
     finalize_media,
+    media_input_path,
     start_media_process,
     transcode_target,
 )
@@ -27,24 +29,33 @@ RECORD_SIZE_LIMIT = TELEGRAM_UPLOAD_LIMIT
 PROBE_TIMEOUT = 30
 TRANSCODE_TIMEOUT = 120
 SILK_HEADERS = (b"#!SILK_V3", b"\x02#!SILK_V3")
+_SIGXFSZ = getattr(signal, "SIGXFSZ", None)
 
 _PILK_WORKER = f"""
-import resource
 import sys
 import pilk
 
 limit = int(sys.argv[3])
-resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+try:
+    import resource
+except ImportError:
+    resource = None
+if resource is not None:
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
 pilk.decode(sys.argv[1], sys.argv[2], pcm_rate={SILK_SAMPLE_RATE})
 """
 
 _EXEC_WITH_FILE_LIMIT = """
 import os
-import resource
 import sys
 
 limit = int(sys.argv[1])
-resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+try:
+    import resource
+except ImportError:
+    resource = None
+if resource is not None:
+    resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
 os.execvp(sys.argv[2], sys.argv[2:])
 """
 
@@ -68,13 +79,15 @@ async def normalize_onebot_record(media: MediaFile) -> None:
                 media.rewind()
                 emit_runtime_event("capability.succeeded", "onebot.voice.compatible")
                 return
-            input_fd = media.fileno()
-            media.rewind()
-            await _transcode_to_ogg(
-                input_path=f"/proc/self/fd/{input_fd}",
-                output_path=output_path,
-                pass_fds=(input_fd,),
-            )
+            async with media_input_path(
+                media,
+                suffix=Path(media.filename).suffix or ".audio",
+            ) as (input_path, process_kwargs):
+                await _transcode_to_ogg(
+                    input_path=input_path,
+                    output_path=output_path,
+                    process_kwargs=process_kwargs,
+                )
 
         output_size = output_path.stat().st_size
         if output_size > RECORD_SIZE_LIMIT:
@@ -89,25 +102,27 @@ async def normalize_onebot_record(media: MediaFile) -> None:
 
 
 async def _decode_silk(media: MediaFile, pcm_path: Path) -> None:
-    input_fd = media.fileno()
-    media.rewind()
-    process = await start_media_process(
-        sys.executable,
-        "-c",
-        _PILK_WORKER,
-        f"/proc/self/fd/{input_fd}",
-        str(pcm_path),
-        str(RECORD_SIZE_LIMIT),
-        pass_fds=(input_fd,),
-        missing_error="语音转发需要安装 ffmpeg 和 ffprobe",
-    )
-    _, stderr = await communicate_media_process(
-        process,
-        timeout=TRANSCODE_TIMEOUT,
-        timeout_error="OneBot 语音处理超时",
-    )
+    async with media_input_path(media, suffix=".silk") as (
+        input_path,
+        process_kwargs,
+    ):
+        process = await start_media_process(
+            sys.executable,
+            "-c",
+            _PILK_WORKER,
+            input_path,
+            str(pcm_path),
+            str(RECORD_SIZE_LIMIT),
+            **process_kwargs,
+            missing_error="语音转发需要安装 ffmpeg 和 ffprobe",
+        )
+        _, stderr = await communicate_media_process(
+            process,
+            timeout=TRANSCODE_TIMEOUT,
+            timeout_error="OneBot 语音处理超时",
+        )
     pcm_size = pcm_path.stat().st_size
-    if process.returncode == -signal.SIGXFSZ or (
+    if (_SIGXFSZ is not None and process.returncode == -_SIGXFSZ) or (
         process.returncode != 0 and pcm_size >= RECORD_SIZE_LIMIT
     ):
         raise MediaTooLargeError(
@@ -118,26 +133,28 @@ async def _decode_silk(media: MediaFile, pcm_path: Path) -> None:
 
 
 async def _probe_audio(media: MediaFile) -> tuple[str, str]:
-    input_fd = media.fileno()
-    media.rewind()
-    process = await start_media_process(
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=format_name:stream=codec_type,codec_name",
-        "-of",
-        "json",
-        f"/proc/self/fd/{input_fd}",
-        pass_fds=(input_fd,),
-        stdout=asyncio.subprocess.PIPE,
-        missing_error="语音转发需要安装 ffmpeg 和 ffprobe",
-    )
-    stdout, stderr = await communicate_media_process(
-        process,
-        timeout=PROBE_TIMEOUT,
-        timeout_error="OneBot 语音处理超时",
-    )
+    async with media_input_path(
+        media,
+        suffix=Path(media.filename).suffix or ".audio",
+    ) as (input_path, process_kwargs):
+        process = await start_media_process(
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=format_name:stream=codec_type,codec_name",
+            "-of",
+            "json",
+            input_path,
+            stdout=asyncio.subprocess.PIPE,
+            **process_kwargs,
+            missing_error="语音转发需要安装 ffmpeg 和 ffprobe",
+        )
+        stdout, stderr = await communicate_media_process(
+            process,
+            timeout=PROBE_TIMEOUT,
+            timeout_error="OneBot 语音处理超时",
+        )
     if process.returncode != 0:
         raise ValueError(f"无法识别 OneBot 语音格式: {decode_process_error(stderr)}")
     try:
@@ -160,7 +177,7 @@ async def _transcode_to_ogg(
     input_path: str,
     output_path: Path,
     input_args: tuple[str, ...] = (),
-    pass_fds: tuple[int, ...] = (),
+    process_kwargs: dict[str, Any] | None = None,
 ) -> None:
     ffmpeg_args = (
         *FFMPEG_BASE_ARGS,
@@ -190,7 +207,7 @@ async def _transcode_to_ogg(
         _EXEC_WITH_FILE_LIMIT,
         str(RECORD_SIZE_LIMIT),
         *ffmpeg_args,
-        pass_fds=pass_fds,
+        **(process_kwargs or {}),
         missing_error="语音转发需要安装 ffmpeg 和 ffprobe",
     )
     _, stderr = await communicate_media_process(
@@ -199,7 +216,7 @@ async def _transcode_to_ogg(
         timeout_error="OneBot 语音处理超时",
     )
     output_size = output_path.stat().st_size
-    if process.returncode == -signal.SIGXFSZ or (
+    if (_SIGXFSZ is not None and process.returncode == -_SIGXFSZ) or (
         process.returncode != 0 and output_size >= RECORD_SIZE_LIMIT
     ):
         raise MediaTooLargeError(

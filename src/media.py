@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -85,6 +86,46 @@ async def run_media_thread[T](function: Callable[..., T], /, *args: Any, **kwarg
     return await await_completion_on_cancel(
         asyncio.to_thread(function, *args, **kwargs)
     )
+
+
+@asynccontextmanager
+async def media_input_path(
+    media: MediaFile,
+    *,
+    suffix: str = ".media",
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """为媒体子进程提供一个可读取的输入路径及其进程参数。
+
+    Linux 上使用继承给 ffmpeg/ffprobe 的文件描述符，避免复制媒体内容。Windows
+    没有 ``/proc/self/fd``，而且 ``pass_fds`` 不受 asyncio 子进程支持，因此先把
+    内容复制到一个已关闭的临时文件，再把普通路径传给子进程。
+    """
+    if os.name != "nt":
+        input_fd = media.fileno()
+        media.rewind()
+        yield f"/proc/self/fd/{input_fd}", {"pass_fds": (input_fd,)}
+        return
+
+    with NamedTemporaryFile(
+        suffix=suffix,
+        delete=False,
+        dir=str(ensure_temp_dir()),
+    ) as source:
+        input_path = Path(source.name)
+    try:
+        await run_media_thread(_copy_media_to_path, media, input_path)
+        yield str(input_path), {}
+    finally:
+        input_path.unlink(missing_ok=True)
+
+
+def _copy_media_to_path(media: MediaFile, output_path: Path) -> None:
+    """将 MediaFile 复制到一个可由 Windows 子进程重新打开的路径。"""
+    media.rewind()
+    with output_path.open("wb") as output:
+        while chunk := media.file.read(STREAM_CHUNK_SIZE):
+            output.write(chunk)
+    media.rewind()
 
 
 def replace_media_content(media: MediaFile, output_path: Path) -> None:

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import time
+from pathlib import Path
 
 from src.log import baselog
 from src.media import (
@@ -12,6 +13,7 @@ from src.media import (
     communicate_media_process,
     decode_process_error,
     finalize_media,
+    media_input_path,
     run_media_thread,
     start_media_process,
     transcode_target,
@@ -37,39 +39,41 @@ async def normalize_video_for_onebot(media: MediaFile, *, size_limit: int) -> No
 
     started_at = time.monotonic()
     async with transcode_target(".mp4") as output_path:
-        input_fd = media.fileno()
-        media.rewind()
-        process = await start_media_process(
-            *FFMPEG_BASE_ARGS,
-            "-i",
-            f"/proc/self/fd/{input_fd}",
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            "-fs",
-            str(size_limit + 1),
-            str(output_path),
-            pass_fds=(input_fd,),
-            missing_error="视频转发需要安装 ffmpeg 和 ffprobe",
-        )
-        _, stderr = await communicate_media_process(
-            process,
-            timeout=TRANSCODE_TIMEOUT,
-            timeout_error="Telegram 视频处理超时",
-        )
+        async with media_input_path(
+            media,
+            suffix=Path(media.filename).suffix or ".video",
+        ) as (input_path, process_kwargs):
+            process = await start_media_process(
+                *FFMPEG_BASE_ARGS,
+                "-i",
+                input_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a?",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart",
+                "-fs",
+                str(size_limit + 1),
+                str(output_path),
+                **process_kwargs,
+                missing_error="视频转发需要安装 ffmpeg 和 ffprobe",
+            )
+            _, stderr = await communicate_media_process(
+                process,
+                timeout=TRANSCODE_TIMEOUT,
+                timeout_error="Telegram 视频处理超时",
+            )
         if process.returncode != 0:
             raise ValueError(f"Telegram 视频转码失败: {decode_process_error(stderr)}")
         if output_path.stat().st_size > size_limit:
@@ -90,26 +94,28 @@ async def normalize_video_for_onebot(media: MediaFile, *, size_limit: int) -> No
 
 
 async def _probe_codecs(media: MediaFile) -> tuple[str | None, tuple[str, ...]]:
-    input_fd = media.fileno()
-    media.rewind()
-    process = await start_media_process(
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "stream=codec_type,codec_name",
-        "-of",
-        "json",
-        f"/proc/self/fd/{input_fd}",
-        pass_fds=(input_fd,),
-        stdout=asyncio.subprocess.PIPE,
-        missing_error="视频转发需要安装 ffmpeg 和 ffprobe",
-    )
-    stdout, stderr = await communicate_media_process(
-        process,
-        timeout=PROBE_TIMEOUT,
-        timeout_error="Telegram 视频处理超时",
-    )
+    async with media_input_path(
+        media,
+        suffix=Path(media.filename).suffix or ".video",
+    ) as (input_path, process_kwargs):
+        process = await start_media_process(
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name",
+            "-of",
+            "json",
+            input_path,
+            stdout=asyncio.subprocess.PIPE,
+            **process_kwargs,
+            missing_error="视频转发需要安装 ffmpeg 和 ffprobe",
+        )
+        stdout, stderr = await communicate_media_process(
+            process,
+            timeout=PROBE_TIMEOUT,
+            timeout_error="Telegram 视频处理超时",
+        )
     if process.returncode != 0:
         raise ValueError(f"Telegram 视频格式检测失败: {decode_process_error(stderr)}")
     try:
