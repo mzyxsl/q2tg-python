@@ -161,6 +161,14 @@ class TelegramMessage:
     q_message_ids: list[int] = field(default_factory=list)
     next_onebot_batch: int = 0
     q_group_id: int | None = None
+    # Telegram edited messages cannot be edited through OneBot.  The old QQ
+    # message is recalled first and this message is sent as a fresh message;
+    # saving the new mapping makes later Telegram replies target the new ID.
+    replace_existing: bool = False
+    replacement_done: bool = False
+    replacement_finished: bool = False
+    replaced_q_message_ids: tuple[int, ...] = ()
+    replacement_deleted_q_message_ids: set[int] = field(default_factory=set)
     q_forward_complete: bool = False
 
 

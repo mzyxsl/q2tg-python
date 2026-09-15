@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import json
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from secrets import token_hex
@@ -109,6 +110,78 @@ TELEGRAM_TEXT_LIMIT = 4096
 # 事件任务在普通转发保存映射前查询数据库并错误地当作未命中。
 _active_onebot_forwards: set[tuple[int, int]] = set()
 _pending_onebot_recalls: set[tuple[int, int]] = set()
+_suppressed_onebot_recalls: dict[tuple[int, int], float] = {}
+_SUPPRESSED_RECALL_TTL = 120.0
+
+
+@dataclass(slots=True)
+class _TelegramReplacementWaiter:
+    """等待同一 Telegram 消息的全部编辑替换任务完成。"""
+
+    event: asyncio.Event
+    pending: int = 0
+
+
+_telegram_replacement_waiters: dict[tuple[int, int], _TelegramReplacementWaiter] = {}
+
+
+def begin_telegram_replacement(
+    tg_chat_id: int,
+    tg_message_ids: tuple[int, ...] | list[int],
+) -> None:
+    """登记编辑消息，避免其后的 Telegram 回复抢先读取旧映射。"""
+    for tg_message_id in set(tg_message_ids):
+        key = (tg_chat_id, tg_message_id)
+        waiter = _telegram_replacement_waiters.get(key)
+        if waiter is None:
+            waiter = _TelegramReplacementWaiter(event=asyncio.Event())
+            _telegram_replacement_waiters[key] = waiter
+        waiter.pending += 1
+
+
+def finish_telegram_replacement(
+    tg_chat_id: int,
+    tg_message_ids: tuple[int, ...] | list[int],
+) -> None:
+    """结束编辑替换登记；发送失败时也要唤醒等待者，避免队列永久阻塞。"""
+    for tg_message_id in set(tg_message_ids):
+        key = (tg_chat_id, tg_message_id)
+        waiter = _telegram_replacement_waiters.get(key)
+        if waiter is None:
+            continue
+        waiter.pending -= 1
+        if waiter.pending > 0:
+            continue
+        waiter.event.set()
+        _telegram_replacement_waiters.pop(key, None)
+
+
+async def wait_for_telegram_replacement(tg_chat_id: int, tg_message_id: int) -> None:
+    """等待回复目标的编辑替换任务完成后再解析 OneBot 映射。"""
+    waiter = _telegram_replacement_waiters.get((tg_chat_id, tg_message_id))
+    if waiter is not None:
+        await waiter.event.wait()
+
+
+def suppress_onebot_recall(q_group_id: int, q_message_id: int) -> None:
+    """标记桥接自身触发的 QQ 撤回，避免 OneBot 回调删除 Telegram 原消息。"""
+    now = asyncio.get_running_loop().time()
+    _suppressed_onebot_recalls[(q_group_id, q_message_id)] = now
+    expired = [
+        key
+        for key, created_at in _suppressed_onebot_recalls.items()
+        if now - created_at > _SUPPRESSED_RECALL_TTL
+    ]
+    for key in expired:
+        _suppressed_onebot_recalls.pop(key, None)
+
+
+def consume_suppressed_onebot_recall(q_group_id: int, q_message_id: int) -> bool:
+    """消费桥接自身的 QQ 撤回回调；过期标记按普通撤回处理。"""
+    created_at = _suppressed_onebot_recalls.pop((q_group_id, q_message_id), None)
+    if created_at is None:
+        return False
+    return asyncio.get_running_loop().time() - created_at <= _SUPPRESSED_RECALL_TTL
 
 
 def begin_onebot_forward(q_group_id: int, q_message_id: int) -> bool:
@@ -1306,8 +1379,12 @@ async def forward_telegram_to_onebot(msg: TelegramMessage, gateway: QGateway) ->
         baselog.warning("Telegram 消息没有可转发的内容: %s", msg.message_ids)
         return
 
+    if msg.replace_existing and not msg.replacement_done:
+        await _recall_replaced_onebot_messages(msg, gateway)
+
     reply_q_message_id = None
     if msg.reply_message_id is not None:
+        await wait_for_telegram_replacement(msg.group_id, msg.reply_message_id)
         reply_mapping = await _get_q_message(msg.group_id, msg.reply_message_id)
         if reply_mapping is not None and reply_mapping.q_message_ids:
             emit_runtime_event("capability.succeeded", "telegram.reply.mapped")
@@ -1387,6 +1464,31 @@ async def forward_telegram_to_onebot(msg: TelegramMessage, gateway: QGateway) ->
 
     msg.q_forward_complete = True
     await _save_telegram_message_mapping(msg)
+
+
+async def _recall_replaced_onebot_messages(
+    msg: TelegramMessage,
+    gateway: QGateway,
+) -> None:
+    """撤回 Telegram 编辑对应的 QQ 端旧消息，然后发送新消息。"""
+    if not msg.replaced_q_message_ids:
+        mapping = await _get_q_message(msg.group_id, msg.message_ids[0])
+        if mapping is not None:
+            msg.replaced_q_message_ids = mapping.q_message_ids
+    for message_id in msg.replaced_q_message_ids:
+        if message_id in msg.replacement_deleted_q_message_ids:
+            continue
+        try:
+            suppress_onebot_recall(msg.q_group_id, message_id)
+            await gateway.delete_message(message_id)
+        except OneBotConnectionError:
+            raise
+        except OneBotResultUnknownError:
+            raise
+        except Exception as error:
+            raise OneBotSendError from error
+        msg.replacement_deleted_q_message_ids.add(message_id)
+    msg.replacement_done = True
 
 
 async def _save_telegram_message_mapping(msg: TelegramMessage) -> None:
@@ -1543,6 +1645,9 @@ def telegram_group_member_task(
 
 async def finalize_telegram_message(msg: TelegramMessage) -> None:
     """任务结束后归还队列预算，并关闭未被缓存接管的文件。"""
+    if msg.replace_existing and not msg.replacement_finished:
+        msg.replacement_finished = True
+        finish_telegram_replacement(msg.group_id, msg.message_ids)
     if msg.queue_bytes:
         await media_queue_budget.release(msg.queue_bytes)
         msg.queue_bytes = 0

@@ -44,6 +44,8 @@ from telegram.helpers import escape_markdown
 from src.bus import message_bus
 from src.config import config
 from src.forwarding import (
+    begin_telegram_replacement,
+    finish_telegram_replacement,
     telegram_forward_task,
     telegram_group_member_task,
     telegram_pin_task,
@@ -1034,12 +1036,67 @@ class TGhandlers:
         """把 Telegram 群中的文本转换为 TelegramMessage。"""
         await self._receive_text(update, context, bot_forward_required=False)
 
+    async def receive_edited_message(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        """把 Telegram 编辑后的消息作为新 OneBot 消息发送。
+
+        OneBot 没有跨实现通用的“编辑消息”动作，因此由发送层撤回旧映射后
+        重新发送。这样同一 Telegram message_id 的后续回复会通过新映射指向
+        新的 OneBot message_id。
+        """
+        msg = getattr(update, "edited_message", None) or update.effective_message
+        if msg is None:
+            return
+        if self._message_has_media(msg):
+            try:
+                await self._enqueue_media_while_connected(
+                    [msg],
+                    context.bot.id,
+                    replace_existing=True,
+                )
+            except ValueError as error:
+                await msg.reply_text(str(error))
+                emit_runtime_event(
+                    "inbound.rejected",
+                    f"telegram-edited-media:{telegram_media_kind(msg)}",
+                    error=error,
+                )
+            return
+        await self._receive_text(
+            update,
+            context,
+            bot_forward_required=self._message_is_command(msg),
+            replace_existing=True,
+        )
+
+    @staticmethod
+    def _message_has_media(msg: Message) -> bool:
+        return bool(
+            getattr(msg, "photo", None)
+            or getattr(msg, "video", None) is not None
+            or getattr(msg, "voice", None) is not None
+            or getattr(msg, "audio", None) is not None
+            or getattr(msg, "document", None) is not None
+            or getattr(msg, "sticker", None) is not None
+        )
+
+    @staticmethod
+    def _message_is_command(msg: Message) -> bool:
+        return any(
+            getattr(entity, "type", None) == MessageEntity.BOT_COMMAND
+            for entity in (getattr(msg, "entities", None) or ())
+        )
+
     async def _receive_text(
         self,
         update: Update,
         context: ContextTypes.DEFAULT_TYPE,
         *,
         bot_forward_required: bool,
+        replace_existing: bool = False,
     ) -> None:
         msg = update.effective_message
         if msg is None:
@@ -1091,11 +1148,21 @@ class TGhandlers:
             reply_message_id=(
                 msg.reply_to_message.message_id if msg.reply_to_message is not None else None
             ),
+            replace_existing=replace_existing,
         )
-        await self._put_onebot_task(
-            msg,
-            telegram_forward_task(message, q_gateway, context.bot),
-        )
+        if replace_existing:
+            begin_telegram_replacement(msg.chat_id, message.message_ids)
+        try:
+            enqueued = await self._put_onebot_task(
+                msg,
+                telegram_forward_task(message, q_gateway, context.bot),
+            )
+        except BaseException:
+            if replace_existing:
+                finish_telegram_replacement(msg.chat_id, message.message_ids)
+            raise
+        if replace_existing and not enqueued:
+            finish_telegram_replacement(msg.chat_id, message.message_ids)
 
     async def receive_command(
         self,
@@ -1211,16 +1278,28 @@ class TGhandlers:
         self,
         messages: list[Message],
         bot_id: int | None,
+        *,
+        replace_existing: bool = False,
     ) -> None:
         try:
             await message_bus.run_while_target_available(
                 SendTarget.ONEBOT,
-                self._enqueue_media(messages, bot_id),
+                self._enqueue_media(
+                    messages,
+                    bot_id,
+                    replace_existing=replace_existing,
+                ),
             )
         except SendTargetUnavailableError as error:
             raise ValueError(ONEBOT_SEND_FAILED_TEXT) from error
 
-    async def _enqueue_media(self, messages: list[Message], bot_id: int | None = None) -> None:
+    async def _enqueue_media(
+        self,
+        messages: list[Message],
+        bot_id: int | None = None,
+        *,
+        replace_existing: bool = False,
+    ) -> None:
         """下载一组 Telegram 媒体，取得资源预算后放入消息队列。
 
          Telegram 的 Message.photo 是同一张照片的多个尺寸，不是多张照片；这里
@@ -1283,6 +1362,9 @@ class TGhandlers:
             elif (document := message.document) is not None:
                 sources.append(("file", document, TELEGRAM_DOWNLOAD_LIMIT, "none"))
 
+        if not sources:
+            return
+
         work_id = f"telegram-to-onebot:{first.chat_id}:{tuple(message.message_id for message in messages)}"
         for kind, _, _, processing in sources:
             capability = {
@@ -1312,6 +1394,12 @@ class TGhandlers:
 
         if self.download_client is None:
             raise RuntimeError("Telegram 媒体下载客户端尚未启动")
+
+        replacement_registered = replace_existing
+        replacement_handed_off = False
+        replacement_message_ids = tuple(message.message_id for message in messages)
+        if replacement_registered:
+            begin_telegram_replacement(first.chat_id, replacement_message_ids)
 
         media: list[TelegramMedia] = []
         # 先按最坏情况占用队列预算，再开始网络下载。否则多个并发相册都可能先
@@ -1433,6 +1521,7 @@ class TGhandlers:
                     ),
                     None,
                 ),
+                replace_existing=replace_existing,
                 # 媒体组 caption 通常只附在其中一项，取第一条非空文本。
                 media=tuple(media),
                 # 视频转码可能改变大小，预处理完成前保留最坏情况预算。
@@ -1442,6 +1531,7 @@ class TGhandlers:
                 task = telegram_processing_task(message, q_gateway, first.get_bot())
                 if not media_processor.submit(task):
                     raise ValueError("Telegram 媒体处理队列已满，请稍后重试")
+                replacement_handed_off = True
             else:
                 try:
                     await message_bus.put(
@@ -1449,6 +1539,7 @@ class TGhandlers:
                     )
                 except SendTargetUnavailableError as error:
                     raise ValueError(ONEBOT_SEND_FAILED_TEXT) from error
+                replacement_handed_off = True
         except BaseException:
             # BaseException 包含任务取消；关停时取消相册任务也必须关闭临时文件，
             # 并归还已经取得但尚未使用的两类预算。
@@ -1458,6 +1549,8 @@ class TGhandlers:
                 media_item_budget.release(reserved_items)
             if reserved_bytes:
                 await media_queue_budget.release(reserved_bytes)
+            if replacement_registered and not replacement_handed_off:
+                finish_telegram_replacement(first.chat_id, replacement_message_ids)
             raise
 
         if not media:
@@ -1465,7 +1558,9 @@ class TGhandlers:
 
     def get_handlers(self) -> list[BaseHandler]:
         """显式创建全部 PTB handlers，注册顺序与匹配优先级一目了然。"""
-        media_filter = filters.ChatType.GROUPS & (
+        edited_message_filter = filters.UpdateType.EDITED_MESSAGE
+        edited_filter = filters.ChatType.GROUPS & edited_message_filter
+        media_filter = filters.ChatType.GROUPS & ~edited_message_filter & (
             filters.PHOTO
             | filters.VIDEO
             | filters.VOICE
@@ -1481,7 +1576,10 @@ class TGhandlers:
             *command_handlers,
             InlineQueryHandler(self.inline_at, pattern=r"^at(?:\s|$)"),
             MessageHandler(
-                filters.ChatType.GROUPS & filters.TEXT & filters.COMMAND,
+                filters.ChatType.GROUPS
+                & ~edited_message_filter
+                & filters.TEXT
+                & filters.COMMAND,
                 self.receive_command,
             ),
             MessageHandler(
@@ -1497,8 +1595,15 @@ class TGhandlers:
                 self.receive_group_member,
             ),
             MessageHandler(
-                filters.ChatType.GROUPS & filters.TEXT & ~filters.COMMAND,
+                filters.ChatType.GROUPS
+                & ~edited_message_filter
+                & filters.TEXT
+                & ~filters.COMMAND,
                 self.receive_message,
+            ),
+            MessageHandler(
+                edited_filter,
+                self.receive_edited_message,
             ),
             MessageHandler(media_filter, self.receive_media),
         ]

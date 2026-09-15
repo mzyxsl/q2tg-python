@@ -13,6 +13,7 @@ from src.bus import message_bus
 from src.forwarding import (
     abandon_onebot_forward,
     begin_onebot_forward,
+    consume_suppressed_onebot_recall,
     onebot_essence_task,
     onebot_forward_task,
     onebot_group_ban_task,
@@ -403,6 +404,13 @@ async def _receive_group_recall_notice(
     message_id = _onebot_int(data.get("message_id"))
     if group_id is None or message_id is None:
         qlog.warning("丢弃字段不规范的 OneBot 群消息撤回事件")
+        return
+    if consume_suppressed_onebot_recall(group_id, message_id):
+        qlog.debug(
+            "忽略桥接自身触发的 OneBot 撤回回调: group=%s message=%s",
+            group_id,
+            message_id,
+        )
         return
     if request_onebot_recall(group_id, message_id):
         return

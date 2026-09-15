@@ -12,6 +12,7 @@ from telegram import LinkPreviewOptions
 from telegram.ext import ExtBot
 
 from src.bus import MessageBus
+from src.forwarding import suppress_onebot_recall
 from src.messages import SendLane, SendTarget, SendTask
 from src.qbot import receive_onebot_event
 from src.sql import Sql
@@ -103,6 +104,21 @@ class TestOneBotRecall:
 
         self.delete_messages.assert_not_awaited()
         warning.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_bridge_recall_suppression_does_not_delete_telegram_copy(self) -> None:
+        suppress_onebot_recall(123, 1001)
+        await self._receive_recall(
+            {
+                "post_type": "notice",
+                "notice_type": "group_recall",
+                "group_id": 123,
+                "message_id": 1001,
+            }
+        )
+
+        assert self.bus.telegram_event_queue.empty()
+        self.delete_messages.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_malformed_group_recall_is_not_queued(self) -> None:
