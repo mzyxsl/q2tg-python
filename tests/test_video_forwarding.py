@@ -14,6 +14,7 @@ from src.forwarding import (
     forward_onebot_to_telegram,
     forward_telegram_to_onebot,
     onebot_message_media,
+    onebot_message_text,
 )
 from src.media import MediaFile, media_cache, media_item_budget
 from src.messages import (
@@ -111,6 +112,33 @@ class TestVideoForwarding:
         assert media[2][0] == "file"
         assert media[2][1] == "https://example.test/download/file?id=789"
         assert media[2][2] == "archive.zip"
+
+    async def test_onebot_markdown_image_is_forwarded_as_media(self) -> None:
+        image_url = "https://qqbot.ugcimg.cn/path/result"
+        content = f"**查询结果**\n\n![img #1280px #1280px]\\([{image_url}]({image_url}))"
+        media, unavailable = onebot_message_media(
+            [{"type": "markdown", "data": {"content": content}}]
+        )
+
+        assert media == [("image", image_url, "result")]
+        assert unavailable == []
+        assert await onebot_message_text(
+            [{"type": "markdown", "data": {"content": content}}],
+            123,
+        ) == "查询结果"
+
+        cq_content = (
+            "[CQ:markdown,content=[](%7B%22version%22%3A2%7D)\n" + content
+        )
+        cq_media, cq_unavailable = onebot_message_media(
+            [{"type": "text", "data": {"text": cq_content}}]
+        )
+        assert cq_media == [("image", image_url, "result")]
+        assert cq_unavailable == []
+        assert await onebot_message_text(
+            [{"type": "text", "data": {"text": cq_content}}],
+            123,
+        ) == "查询结果"
 
     async def test_onebot_file_uses_send_document(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:

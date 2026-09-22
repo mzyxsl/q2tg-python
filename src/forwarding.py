@@ -6,12 +6,13 @@ import asyncio
 import base64
 import binascii
 import json
+import re
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from secrets import token_hex
 from typing import TYPE_CHECKING, Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 
 import filetype
 import httpx
@@ -105,6 +106,12 @@ UNAVAILABLE_REPLY_TEXT = "[回复了一个无法读取的消息]"
 TELEGRAM_VIDEO_LIMIT = 20_000_000
 TELEGRAM_CAPTION_LIMIT = 1024
 TELEGRAM_TEXT_LIMIT = 4096
+
+_MARKDOWN_IMAGE_TARGET = re.compile(
+    r"!\[[^\]\r\n]*\]\\?\((?P<target>[^\r\n]*)"
+)
+_MARKDOWN_TARGET_URL = re.compile(r"https?://[^\s<>\[\]()]++")
+_CQ_MARKDOWN_PREFIX = re.compile(r"\[CQ:markdown[^\r\n]*\)\s*")
 
 # 普通转发和撤回由不同消费者执行。这里记录尚未结束的 OneBot 消息，防止撤回
 # 事件任务在普通转发保存映射前查询数据库并错误地当作未命中。
@@ -249,12 +256,25 @@ async def onebot_message_text(
         if kind == "text":
             text = data.get("text") if isinstance(data, dict) else None
             if isinstance(text, str):
+                if "[CQ:markdown" in text or _MARKDOWN_IMAGE_TARGET.search(text):
+                    text = _onebot_markdown_text(text)
                 parts.append(escape_markdown(text, version=2) if markdown_v2 else text)
             continue
         if kind == "face" and isinstance(data, dict):
             face_id = data.get("id")
             if face_id is not None:
                 parts.append(render_onebot_face(face_id))
+            continue
+        if kind == "markdown":
+            content = data.get("content") if isinstance(data, dict) else None
+            if isinstance(content, str):
+                markdown_text = _onebot_markdown_text(content)
+                if markdown_text:
+                    parts.append(
+                        escape_markdown(markdown_text, version=2)
+                        if markdown_v2
+                        else markdown_text
+                    )
             continue
         if kind != "at" or not isinstance(data, dict):
             continue
@@ -316,6 +336,26 @@ def onebot_message_media(
     unavailable: list[str] = []
     for segment in message:
         kind = segment.get("type")
+        if kind == "text":
+            data = segment.get("data")
+            content = data.get("text") if isinstance(data, dict) else None
+            if isinstance(content, str):
+                for url in _onebot_markdown_image_urls(content):
+                    filename = Path(urlsplit(url).path).name or "image"
+                    item = ("image", url, filename)
+                    if item not in media:
+                        media.append(item)
+            continue
+        if kind == "markdown":
+            data = segment.get("data")
+            content = data.get("content") if isinstance(data, dict) else None
+            if isinstance(content, str):
+                for url in _onebot_markdown_image_urls(content):
+                    filename = Path(urlsplit(url).path).name or "image"
+                    item = ("image", url, filename)
+                    if item not in media:
+                        media.append(item)
+            continue
         if kind not in {"file", "image", "record", "video"}:
             continue
         data = segment.get("data")
@@ -329,6 +369,34 @@ def onebot_message_media(
         filename = _onebot_media_filename(data.get("file"), kind)
         media.append((kind, url, filename))
     return media, unavailable
+
+
+def _onebot_markdown_image_urls(content: str) -> tuple[str, ...]:
+    """提取 QQ Markdown 图片地址，并去除嵌套链接语法产生的重复 URL。"""
+    content = unquote(content)
+    content = _CQ_MARKDOWN_PREFIX.sub("", content, count=1)
+    urls: list[str] = []
+    for image in _MARKDOWN_IMAGE_TARGET.finditer(content):
+        target_urls = _MARKDOWN_TARGET_URL.findall(image.group("target"))
+        if not target_urls:
+            continue
+        # QQ Bot 常生成 ``![alt]([url](url))``；最后一个 URL 是链接目标，
+        # 普通 ``![alt](url)`` 也只有这一项。
+        url = target_urls[-1].rstrip("\\")
+        if is_http_url(url) and url not in urls:
+            urls.append(url)
+    return tuple(urls)
+
+
+def _onebot_markdown_text(content: str) -> str:
+    """把 Markdown 段中的正文转成不带图片链接的普通文本。"""
+    content = unquote(content)
+    content = _CQ_MARKDOWN_PREFIX.sub("", content, count=1)
+    text = _MARKDOWN_IMAGE_TARGET.sub("", content)
+    text = re.sub(r"\[\]\([^\r\n]*\)", "", text)
+    text = re.sub(r"\[([^\]\r\n]+)\]\(https?://[^)\r\n]+\)", r"\1", text)
+    text = re.sub(r"(?<!\\)(?:\*\*|__|~~|`)", "", text)
+    return text.replace(r"\(", "(").replace(r"\)", ")").strip()
 
 
 def onebot_group_announcement(
